@@ -128,9 +128,9 @@ RawSerial pc(SERIAL_TX, SERIAL_RX);
 
 Thread outThread(osPriorityAboveNormal,1024);  // Output to serial port
 Thread inThread(osPriorityAboveNormal,1024);  // Input from serial port
-Thread motorCtrlT(osPriorityNormal,1024);
+Thread motorCtrlT(osPriorityNormal,1024);    // Motor control thread
 
-/*********************************Function prototypes***********************************/
+/*********************************Function prototypes************************************/
 
 void putMessage(msgCode code, float message); 
 void motorOut(int8_t driveState);
@@ -144,7 +144,7 @@ void motorISR();
 void motorCtrlFn();
 void motorCtrlTick();
 
-/******************************************Main******************************************/
+/*****************************************Main*******************************************/
 
 int main() {
     
@@ -220,14 +220,17 @@ int main() {
     }
 }
 
-/***********************************Motor Control***********************************/
+/********************************Set motor control ticker********************************/
 
 void motorCtrlTick(){
     motorCtrlT.signal_set(0x1);
 }
 
+/*************************************Motor control**************************************/
+
 void motorCtrlFn(){
-    //Variables
+    
+    //Declare variables
     Ticker motorCtrlTicker;
     int32_t locMotorPosition;
     int32_t velocity;
@@ -239,67 +242,72 @@ void motorCtrlFn(){
     int32_t Tr;
     int32_t torque;
     static float rotationErrorOld;
-    //Control Variables
+    
+    //Delcare control Variables
     int32_t kps = 36;
     int32_t kpr = 35;
     float kdr = 16.0;
-    //Attach ticker to callback function that will run every 100 ms
+    
+    //Attach motor ticker to the callback function, running every 100 ms
     motorCtrlTicker.attach_us(&motorCtrlTick,100000);
     while(1){
         motorISR();
         motorCtrlT.signal_wait(0x1);
         
         core_util_critical_section_enter();
-        locMotorPosition = motorPosition;//Access shared variables here
+        locMotorPosition = motorPosition;   //Access shared variables here
         core_util_critical_section_exit();
         
         velocity = (locMotorPosition - oldMotorPosition) * 10;
         oldMotorPosition = locMotorPosition;
         motorCtrlCounter++;
-        if (motorCtrlCounter >= 10) {                   //Every 10th iteration
-            motorCtrlCounter = 0;                       //Reset counter
-            putMessage(msgVelocityOut, float(velocity));      //Report the current velocity
-            putMessage(msgPositionOut, float(locMotorPosition));   //Report the current position
+        if (motorCtrlCounter >= 10) {   //Reset the counter every 10th iteration
+            motorCtrlCounter = 0; 
+            putMessage(msgVelocityOut, float(velocity));    //Reports the current velocity
+            putMessage(msgPositionOut, float(locMotorPosition));    //Reports the current position
         }
         
-        //******Speed controller*****
-        speedError = (endVelocity * 6) * 1.1 - abs(velocity);        //Read global variable endVelocity updated by interrupt and calculate error between target and reality
-                                            //Initialise controller output Ts  
-        if (speedError == -abs(velocity)) {                  //Check if user entered V0, 
-            Ts = PWMPERIOD;                                 //and set the output to maximum as specified
+        //Speed controller
+        speedError = (endVelocity * 6) * 1.1 - abs(velocity);   //Read endVelocity and calculate the velocity error
+        
+        //Initialise controller output Ts  
+        if (speedError == -abs(velocity)) {
+            Ts = PWMPERIOD;   
         }
         else {
-            Ts = (int)(kps * speedError);                    //If the user didn't enter V0 implement controller transfer function: Ts = Kp * (s -|v|) where,
+            Ts = (int)(kps * speedError);
         }
-         //******Rotation controller*****
-        rotationError = endRotation * 0.98 - (locMotorPosition/6);            //Read global variable endRotation updated by interrupt and calculate the rotation error. 
-                                              //Initialise controller output Tr
-        Tr = kpr*rotationError + kdr*(rotationError - rotationErrorOld);       //Implement controller transfer function Ts= Kp*Er + Kd* (dEr/dt)        
-        rotationErrorOld = rotationError;            //Update rotation error                         
-        if(rotationError < 0){                                  //Use the sign of the error to set controller wrt direction of rotation
+        
+        //Rotation controller
+        rotationError = endRotation * 0.98 - (locMotorPosition/6);  //Read endRotation and calculate the rotation error. 
+        
+        //Initialise controller output Tr
+        Tr = kpr*rotationError + kdr*(rotationError - rotationErrorOld);    //Implement controller transfer function Ts= Kp*Er + Kd* (dEr/dt)        
+        rotationErrorOld = rotationError;   //Update rotation error                         
+        if(rotationError < 0){  //Use error's sign to set the controller, relative to the direction of rotation
             Ts = -Ts;                               
         }
         
-        if((velocity>=0 && Ts<Tr) || (velocity<0 && Ts>Tr) || (endRotation == 0)){        //Choose Ts or Tr based on distance from target value so that it takes 
-            torque = Ts;                                            //appropriate steps in the right direction to reach target value
+        //Choose Ts or Tr based on distance from target value
+        if((velocity>=0 && Ts<Tr) || (velocity<0 && Ts>Tr) || (endRotation == 0)){   so that it takes 
+            torque = Ts; 
         }
         else{
             torque = Tr;
         }
-        if(torque < 0){                                             //Variable torque cannot be negative since it sets the PWM  
-            torque = -torque;                                       //Hence we make the value positive, 
-            lead = -2;                                              //and instead set the direction to the opposite one
+        if(torque < 0){ //Variable torque can't be negative as it sets the PWM so make it positive
+            torque = -torque;  
+            lead = -2;  //Reverse the direction
         }
         else{
             lead = 2;
         }
-        if(torque > PWMPERIOD){                                        //In case the calculated PWM is higher than our maximum 75% allowance,
-            torque = PWMPERIOD;                                        //Set it to our max.
-        }                                                   //Ts = controller output, Kp = prop controller constant, s = end velocity and v is the measured velocity
+        if(torque > PWMPERIOD){ //Set PWM to the 75% max if it's greater
+            torque = PWMPERIOD; 
+        }
         
         motorTorque = torque;
         
-        //putMessage(msgTorque, float(motorTorque));
     }
 }
 
