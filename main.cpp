@@ -49,11 +49,10 @@ enum msgCode {
 
 //Motor Torque
 #define PWMPERIOD 2000
-
 //Structure defining new data type for storing messages
 typedef struct {
     msgCode code;           //Message code
-    uint32_t message;       //Message data
+    int32_t message;       //Message data
 } message_t;   
 
 /********************************Global Variables*****************************************/
@@ -78,7 +77,7 @@ const int8_t driveTable[] = {0x12,0x18,0x09,0x21,0x24,0x06,0x00,0x00};
 const int8_t stateMap[] = {0x07,0x05,0x03,0x04,0x01,0x00,0x02,0x07};
 
 //Phase lead to make motor spin
-const int8_t lead = 2;  //2 for forwards, -2 for backwards
+int8_t lead = 2;  //2 for forwards, -2 for backwards
 
 // Represents 6 times the number of revolutions
 volatile int32_t motorPosition; 
@@ -104,8 +103,10 @@ DigitalOut L3H(L3Hpin);
 
 //PwmOut PWM(PWMpin);
 
+//*****Initial Values*****
 volatile uint32_t motorTorque = 1500; //initialise PWM to 75%
-
+volatile float endVelocity = 30.0;
+volatile float endRotation = 100.0;
 //Key required for mining
 volatile uint64_t newKey;   // Key
 Mutex newKey_mutex;         // Mutex prevents deadlock.
@@ -205,14 +206,14 @@ int main() {
         newKey_mutex.unlock();  //Unlocks the value
         
         SHA256Instance.computeHash(hash, sequence, 64); //Computes the hash
-        
+    hashCtr++;
         if ((hash[0]==0)&&(hash[1]==0)){
             putMessage(msgNonceMatch, *nonce);  //Print the nonce when matched
-            hashCtr++;
+           
         }
         (*nonce)++;     //Increment nonce
-        if (btcTimer.read()>=30){
-            putMessage(msgHashRate, (float)(hashCtr*2));
+        if (btcTimer.read()>=1){
+            putMessage(msgHashRate, (float)(hashCtr));
             hashCtr = 0;
             btcTimer.reset();
         }
@@ -226,14 +227,26 @@ void motorCtrlTick(){
 }
 
 void motorCtrlFn(){
+    //Variables
     Ticker motorCtrlTicker;
     int32_t locMotorPosition;
     int32_t velocity;
     static int32_t oldMotorPosition = 0;
     uint8_t motorCtrlCounter = 0;
+    float speedError;
+    float rotationError;
+    int32_t Ts;  
+    int32_t Tr;
+    int32_t torque;
+    static float rotationErrorOld;
+    //Control Variables
+    int32_t kps = 36;
+    int32_t kpr = 35;
+    float kdr = 16.0;
     //Attach ticker to callback function that will run every 100 ms
     motorCtrlTicker.attach_us(&motorCtrlTick,100000);
     while(1){
+        motorISR();
         motorCtrlT.signal_wait(0x1);
         
         core_util_critical_section_enter();
@@ -248,6 +261,45 @@ void motorCtrlFn(){
             putMessage(msgVelocityOut, float(velocity));      //Report the current velocity
             putMessage(msgPositionOut, float(locMotorPosition));   //Report the current position
         }
+        
+        //******Speed controller*****
+        speedError = (endVelocity * 6) * 1.1 - abs(velocity);        //Read global variable endVelocity updated by interrupt and calculate error between target and reality
+                                            //Initialise controller output Ts  
+        if (speedError == -abs(velocity)) {                  //Check if user entered V0, 
+            Ts = PWMPERIOD;                                 //and set the output to maximum as specified
+        }
+        else {
+            Ts = (int)(kps * speedError);                    //If the user didn't enter V0 implement controller transfer function: Ts = Kp * (s -|v|) where,
+        }
+         //******Rotation controller*****
+        rotationError = endRotation * 0.98 - (locMotorPosition/6);            //Read global variable endRotation updated by interrupt and calculate the rotation error. 
+                                              //Initialise controller output Tr
+        Tr = kpr*rotationError + kdr*(rotationError - rotationErrorOld);       //Implement controller transfer function Ts= Kp*Er + Kd* (dEr/dt)        
+        rotationErrorOld = rotationError;            //Update rotation error                         
+        if(rotationError < 0){                                  //Use the sign of the error to set controller wrt direction of rotation
+            Ts = -Ts;                               
+        }
+        
+        if((velocity>=0 && Ts<Tr) || (velocity<0 && Ts>Tr) || (endRotation == 0)){        //Choose Ts or Tr based on distance from target value so that it takes 
+            torque = Ts;                                            //appropriate steps in the right direction to reach target value
+        }
+        else{
+            torque = Tr;
+        }
+        if(torque < 0){                                             //Variable torque cannot be negative since it sets the PWM  
+            torque = -torque;                                       //Hence we make the value positive, 
+            lead = -2;                                              //and instead set the direction to the opposite one
+        }
+        else{
+            lead = 2;
+        }
+        if(torque > PWMPERIOD){                                        //In case the calculated PWM is higher than our maximum 75% allowance,
+            torque = PWMPERIOD;                                        //Set it to our max.
+        }                                                   //Ts = controller output, Kp = prop controller constant, s = end velocity and v is the measured velocity
+        
+        motorTorque = torque;
+        
+        //putMessage(msgTorque, float(motorTorque));
     }
 }
 
@@ -261,15 +313,17 @@ void parseCommand(){
             putMessage(msgKeyAdded, newKey);           //Print it out
             newKey_mutex.unlock();
             break;
-            /*
-             case 'V':
-             sscanf(newCommand, "V%f", &targetVel);          //Find desired the target velocity
-             putMessage(msgVelocityIn, targetVel);
-             break;
-             case 'R':
-             sscanf(newCommand, "R%f", &targetRot);          //Find desired target rotation
-             putMessage(msgPositionIn, targetRot);
-             break;*/
+            
+        case 'V':
+            sscanf(newCommand, "V%f", &endVelocity);          //Find desired the end velocity
+            putMessage(msgVelocityIn, endVelocity);
+            break;
+             
+        case 'R':
+            sscanf(newCommand, "R%f", &endRotation);          //Find desired end rotation
+            putMessage(msgPositionIn, endRotation);
+            break;
+            
         case 'T':
             sscanf(newCommand, "T%d", &motorTorque);         //Find desired target torque
             putMessage(msgTorque, motorTorque);         //Print it out
@@ -332,7 +386,7 @@ void commOut() {
                 pc.printf("Current Motor State: %x\n\r", pMessage->message);    //Outputs current motor state
                 break;
             case msgHashRate:
-                pc.printf("The system is mining at a rate of %d Hash/minute\n\r", (int32_t)pMessage->message);    //Outputs current hash rate
+                pc.printf("The system is mining at a rate of %d Hash/second\n\r", (int32_t)pMessage->message);    //Outputs current hash rate
                 break;
             case msgNonceMatch:
                 pc.printf("Nonce Matched! Nonce Code: %x\n\r", pMessage->message);      //Outputs the nonce when correct
@@ -343,21 +397,21 @@ void commOut() {
             case msgTorque:
                 pc.printf("The current motor torque is:\t%d\n\r", pMessage->message);       //Outputs current motor torque
                 break;
-                /*  case msgVelocityIn:
-                 pc.printf("The input velocity is:\t%.2f\n\r", targetVel);
+                
+            case msgVelocityIn:
+                 pc.printf("The input velocity is:\t%d\n\r", (int32_t)pMessage->message);
                  break;
-                 */
+                 
             case msgVelocityOut:
-                pc.printf("The current motor velocity is:\t%.2f\n\r", \
-                          (float)((int32_t)pMessage->message / 6));         //Outputs current velocity
+                pc.printf("The current motor velocity is:\t%.2f\n\r", 
+                          (pMessage->message) / 6.0);         //Outputs current velocity
                 break;
+                
             case msgPositionIn:
-                pc.printf("Target rotation set to:\t%.2f\n\r", \
-                          (float)((int32_t)pMessage->message / 6));         //Outputs target rotation
+                pc.printf("Target rotation set to:\t%.2f\n\r", (pMessage->message));         //Outputs target rotation
                 break;
             case msgPositionOut:
-                pc.printf("Current position:\t%.2f\n\r", \
-                          (float)((int32_t)pMessage->message / 6));         //Outputs current position
+                pc.printf("Current position:\t%.2f\n\r", (pMessage->message)/6.0);         //Outputs current position
                 break;
             case msgError:
                 pc.printf("Debugging position:%x\n\r", pMessage->message);
